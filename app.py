@@ -1,157 +1,207 @@
-import streamlit as st
-import PyPDF2
-import io
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from crewai import Agent, Task, Crew
-from dotenv import load_dotenv
 import os
-from openai import OpenAI
-import re
+import logging
+import pickle
+import base64
+import io
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi.responses import FileResponse, RedirectResponse, JSONResponse
+from fastapi.security import APIKeyHeader
+from pydantic import EmailStr
+from dotenv import load_dotenv
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from langchain.prompts import PromptTemplate
+from langchain.agents import AgentType, initialize_agent
+from langchain.tools import Tool
+from langchain_huggingface import HuggingFaceEndpoint
+from langchain.tools import DuckDuckGoSearchRun
+import PyPDF2
 
-# Load environment variables
 load_dotenv()
 
-# Get API keys from environment variables
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-SENDER_PASSWORD = os.getenv("SENDER_PASSWORD")
+app = FastAPI()
 
-# Debug logging
-st.sidebar.write(f"OPENAI_API_KEY set: {'Yes' if OPENAI_API_KEY else 'No'}")
-st.sidebar.write(f"SENDER_EMAIL set: {'Yes' if SENDER_EMAIL else 'No'}")
-st.sidebar.write(f"SENDER_PASSWORD set: {'Yes' if SENDER_PASSWORD else 'No'}")
+# Configuration
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+APP_API_KEY = os.getenv("APP_API_KEY")
+REDIRECT_URI = "http://127.0.0.1:8000/google/callback"
+SCOPES = ['https://www.googleapis.com/auth/gmail.send']
 
-# Initialize OpenAI client
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    st.sidebar.success("OpenAI client initialized successfully")
-else:
-    st.sidebar.warning("OpenAI API key is not set. Fallback analysis will be used.")
+# Logging configuration
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-# PDF Analysis function
-def extract_text_from_pdf(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_file.read()))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
+class BloodTestCrew:
+    def __init__(self, huggingface_api_key):
+        self.huggingface_api_key = huggingface_api_key
+        self.search_tool = DuckDuckGoSearchRun()
+        self.llm = self.initialize_llm()
 
+    def initialize_llm(self):
+        try:
+            llm = HuggingFaceEndpoint(
+                repo_id="gpt2",  # Changed to a text generation model
+                task="text-generation",
+                huggingfacehub_api_token=self.huggingface_api_key
+            )
+            return llm
+        except Exception as e:
+            logger.error(f"Failed to initialize LLM: {e}")
+            raise
 
-# Email function
-def send_email(recipient, subject, body):
-    message = MIMEMultipart()
-    message["From"] = SENDER_EMAIL
-    message["To"] = recipient
-    message["Subject"] = subject
-    message.attach(MIMEText(body, "plain"))
+    def analyze_blood_test(self, pdf_content, email):
+        try:
+            pdf_text = self.extract_text_from_pdf(pdf_content)
+            logger.info(f"Extracted PDF Text: {pdf_text[:100]}")  # Log the first 100 chars
+
+            tools = [
+                Tool(
+                    name="DuckDuckGo Search",
+                    func=self.search_articles,
+                    description="Use DuckDuckGo to search for health articles"
+                )
+            ]
+
+            agent = initialize_agent(
+                tools,
+                self.llm,
+                agent=AgentType.REACT_DOCSTORE,
+                verbose=True
+            )
+
+            prompt = f"Analyze this blood test report: {pdf_text}"
+            logger.info(f"Prompt for Agent: {prompt}")
+
+            result = agent.run(prompt)
+            logger.info(f"Agent Result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Failed to analyze blood test: {e}")
+            return f"Failed to analyze blood test: {str(e)}"
+
+    def extract_text_from_pdf(self, pdf_content):
+        try:
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+            text = ""
+            for page in pdf_reader.pages:
+                extracted_text = page.extract_text()
+                text += extracted_text if extracted_text else ""
+            return text
+        except Exception as e:
+            logger.error(f"Failed to extract text from PDF: {e}")
+            raise
+
+    def search_articles(self, query):
+        return self.search_tool.run(query)
+
+crew = BloodTestCrew(HUGGINGFACE_API_KEY)
+
+# API key header for authentication
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+# Dependency to validate API key
+def get_api_key(api_key: str = Depends(api_key_header)):
+    if api_key == APP_API_KEY:
+        return api_key
+    raise HTTPException(status_code=401, detail="Invalid API Key")
+
+# Serve the index.html file from the root directory
+@app.get("/", include_in_schema=False)
+async def serve_html():
+    return FileResponse("index.html")
+
+# Endpoint to analyze blood test reports
+@app.post("/analyze_blood_test/")
+async def analyze_blood_test(
+        file: UploadFile = File(...),
+        email: EmailStr = Form(...),
+        api_key: str = Depends(get_api_key)
+):
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.sendmail(SENDER_EMAIL, recipient, message.as_string())
-        return True
-    except smtplib.SMTPAuthenticationError:
-        st.error(
-            "Email authentication failed. Please check your email and password in the .env file. For Gmail, use an App Password.")
-        return False
+        content = await file.read()
+        result = crew.analyze_blood_test(content, email)
+        await send_email(email, "Your Blood Test Analysis", result)
+        return {"message": "Analysis complete. Results sent to your email."}
     except Exception as e:
-        st.error(f"Error sending email: {str(e)}")
-        return False
+        logger.error(f"Failed to analyze blood test: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze blood test: {str(e)}")
 
+# Function to send email with the analysis result using Gmail API and OAuth 2.0
+async def send_email(recipient, subject, body):
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
 
-# Updated GPT-3.5 function
-def call_openai(prompt):
-    if not OPENAI_API_KEY:
-        return "Error: OpenAI API key is not set"
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that analyzes blood test reports."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        if "insufficient_quota" in str(e):
-            st.warning("OpenAI API quota exceeded. Using fallback analysis method.")
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            st.error(f"Error calling OpenAI API: {str(e)}")
-        return "Error: API unavailable"
+            flow = Flow.from_client_secrets_file(
+                'credentials.json',
+                scopes=SCOPES,
+                redirect_uri=REDIRECT_URI
+            )
+            auth_url, _ = flow.authorization_url(prompt='consent')
+            logger.info(f"Please visit this URL to authorize the application: {auth_url}")
+            code = input("Enter the authorization code: ")
+            flow.fetch_token(code=code)
+            creds = flow.credentials
 
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
 
-# Fallback analysis function
-def fallback_analysis(text):
-    # Define some common blood test parameters and their normal ranges
-    parameters = {
-        "Hemoglobin": (13.5, 17.5),  # g/dL
-        "White Blood Cell Count": (4.5, 11.0),  # 10^3/µL
-        "Platelet Count": (150, 450),  # 10^3/µL
-        "Glucose": (70, 100),  # mg/dL
-        "Cholesterol": (0, 200),  # mg/dL
+    service = build('gmail', 'v1', credentials=creds)
+
+    message = {
+        'raw': base64.urlsafe_b64encode(f'To: {recipient}\nSubject: {subject}\n\n{body}'.encode()).decode()
     }
 
-    analysis = []
-    for param, (low, high) in parameters.items():
-        pattern = rf"{param}\D+(\d+\.?\d*)"
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            value = float(match.group(1))
-            if value < low:
-                analysis.append(f"{param} is low at {value}. Normal range is {low}-{high}.")
-            elif value > high:
-                analysis.append(f"{param} is high at {value}. Normal range is {low}-{high}.")
-            else:
-                analysis.append(f"{param} is normal at {value}. Normal range is {low}-{high}.")
+    try:
+        service.users().messages().send(userId='me', body=message).execute()
+        logger.info(f"Email sent successfully to {recipient}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to send email: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
 
-    if not analysis:
-        return "No common blood test parameters found in the report."
-    return "\n".join(analysis)
+# OAuth 2.0 Authorization Endpoint
+@app.get("/authorize/")
+async def authorize():
+    flow = Flow.from_client_secrets_file(
+        'credentials.json',
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+    authorization_url, _ = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true'
+    )
+    return RedirectResponse(url=authorization_url)
 
+# Google Callback Endpoint
+@app.get("/google/callback")
+async def google_callback(code: str):
+    logger.info(f"Received callback with code: {code}")
+    try:
+        flow = Flow.from_client_secrets_file(
+            'credentials.json',
+            scopes=SCOPES,
+            redirect_uri=REDIRECT_URI
+        )
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
 
-# Main application
-def main():
-    st.title("Blood Test Report Analyzer")
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(credentials, token)
 
-    # File uploader
-    uploaded_file = st.file_uploader("Upload your blood test report (PDF)", type="pdf")
-    email = st.text_input("Enter your email address")
-
-    if st.button("Analyze Report"):
-        if uploaded_file and email:
-            # Process the PDF
-            pdf_content = extract_text_from_pdf(uploaded_file)
-
-            # Try OpenAI first, fall back to simple analysis if it fails
-            st.info("Analyzing report...")
-            analysis_result = call_openai(f"Analyze this blood test report: {pdf_content}")
-            if analysis_result.startswith("Error:"):
-                analysis_result = fallback_analysis(pdf_content)
-                recommendation_result = "Based on the analysis, please consult with your healthcare provider for personalized recommendations."
-            else:
-                recommendation_result = call_openai("Provide health recommendations based on the analysis")
-                if recommendation_result.startswith("Error:"):
-                    recommendation_result = "Based on the analysis, please consult with your healthcare provider for personalized recommendations."
-
-            # Display results
-            st.subheader("Analysis Results and Recommendations")
-            st.write(f"Analysis: {analysis_result}")
-            st.write(f"Recommendations: {recommendation_result}")
-
-            # Send email
-            if SENDER_EMAIL and SENDER_PASSWORD:
-                if send_email(email, "Your Blood Test Report Analysis",
-                              f"Analysis: {analysis_result}\n\nRecommendations: {recommendation_result}"):
-                    st.success(f"Results have been sent to {email}")
-            else:
-                st.error("Email credentials are not set. Cannot send email.")
-        else:
-            st.error("Please upload a PDF and enter your email address.")
-
+        return JSONResponse(content={"message": "Authorization successful. You can close this window."})
+    except Exception as e:
+        logger.error(f"Error in google_callback: {str(e)}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
