@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
+google-auth-oauthlib
+google-api-python-client
+langchain
+PyPDF2
+langchain_huggingface
